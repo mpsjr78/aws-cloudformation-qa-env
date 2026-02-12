@@ -1,4 +1,4 @@
-AWS CloudFormation script to create a complete QA environment including EC2, RDS, ELB, etc.
+AWS CloudFormation script to create a complete QA environment including EC2, RDS, ELB, etc. This repo also includes an AWS Lambda script (Python) that the yml script uses to get an specific AMI by tag.
 
 Env vars:
 
