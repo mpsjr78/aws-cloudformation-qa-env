@@ -1,0 +1,933 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS CloudFormation Template (Portfolio / Generic QA Environment):
+  Provisions a VPC with public/private subnets, an Internet-facing ALB,
+  EC2 instances (bastion/web/app), an Aurora Serverless v2 PostgreSQL cluster,
+  a Valkey (ElastiCache-compatible Redis) replication group, and cross-account
+  VPC peering with routes and optional remote SG ingress via Custom Resource.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ExampleApp QA Environment
+
+  EnvironmentName:
+    Type: String
+    Default: QA
+
+  # ---------- Networking (local VPC) ----------
+  VpcCidr:
+    Type: String
+    Default: 192.168.2.0/24
+    Description: CIDR for the new VPC
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 192.168.2.0/26
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 192.168.2.64/26
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 192.168.2.128/26
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 192.168.2.192/26
+
+  # Allow-list for Bastion RDP access (replaces hardcoded corporate IPs)
+  AllowedRdpCidrs:
+    Type: CommaDelimitedList
+    Default: "203.0.113.10/32"
+    Description: Comma-delimited list of CIDRs allowed to access Bastion via RDP (3389)
+
+  # ---------- Peering (remote VPC) ----------
+  PeerAccountId:
+    Type: String
+    Description: Remote AWS account ID (for VPC peering)
+    Default: "123456789012"
+
+  PeerVpcId:
+    Type: String
+    Description: Remote VPC ID
+    Default: "vpc-xxxxxxxxxxxxxxxxx"
+
+  PeerVpcCidr:
+    Type: String
+    Description: Remote VPC CIDR
+    Default: "10.101.0.0/16"
+
+  PeerRoleArn:
+    Type: String
+    Description: IAM role ARN in the peer account that this stack can assume to manage routes/SG
+    Default: "arn:aws:iam::123456789012:role/PEER_MANAGEMENT_ROLE"
+
+  PeerPrivateRouteTableIds:
+    Type: CommaDelimitedList
+    Description: Comma-delimited list of private route table IDs in the peer VPC
+    Default: "rtb-xxxxxxxxxxxxxxxxx,rtb-yyyyyyyyyyyyyyyyy"
+
+  PeerRdsSecurityGroupId:
+    Type: String
+    Description: Security Group ID in the peer VPC that should receive an ingress rule (optional)
+    Default: "sg-xxxxxxxxxxxxxxxxx"
+
+  # Optional extra SG allowed to access local DB (replaces a hardcoded SG id)
+  ExtraDbClientSecurityGroupId:
+    Type: String
+    Default: ""
+    Description: Optional SG ID allowed to reach local DB (leave empty to disable)
+
+  # ---------- ALB / DNS ----------
+  AcmCertificateArn:
+    Type: String
+    Description: ACM certificate ARN for the ALB listener (HTTPS)
+    Default: "arn:aws:acm:us-east-1:123456789012:certificate/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+  HostedZoneId:
+    Type: String
+    Description: Route53 Hosted Zone ID (optional if you don't want DNS automation)
+    Default: "Z0000000000000000000"
+
+  DnsRecordName:
+    Type: String
+    Description: Record name to create (example: *.example.com)
+    Default: "*.example.com"
+
+  # Lambda Custom Resource used to create DNS record (optional)
+  DnsRecordCustomResourceServiceToken:
+    Type: String
+    Description: ServiceToken ARN for a Route53 record Custom Resource Lambda (optional)
+    Default: ""
+  
+  DnsRecordAssumeRoleArn:
+    Type: String
+    Description: Optional role to assume for DNS changes (cross-account)
+    Default: ""
+
+  # ---------- AMI lookup (generic placeholders) ----------
+  AmiInfoServiceToken:
+    Type: String
+    Description: ServiceToken ARN for a Custom Resource that returns AMI IDs (or replace with direct AMI IDs)
+    Default: ""
+
+  # Fallback if you prefer to pass AMIs explicitly instead of using custom AMIInfo
+  BastionAmiId:
+    Type: String
+    Default: ""
+  WebAmiId:
+    Type: String
+    Default: ""
+  AppAmiId:
+    Type: String
+    Default: ""
+
+  # ---------- EC2 ----------
+  InstanceType:
+    Type: String
+    Default: t3a.medium
+
+  Ec2InstanceProfileName:
+    Type: String
+    Default: EC2AdminRole
+    Description: Instance profile name attached to EC2 instances
+
+  # ---------- Database (Aurora) ----------
+  DbSnapshotArn:
+    Type: String
+    Description: Optional snapshot ARN to restore from (leave empty to create fresh cluster)
+    Default: ""
+
+  DbEngineVersion:
+    Type: String
+    Default: "16.6"
+
+  DbMasterUsername:
+    Type: String
+    Default: master
+
+  DbPort:
+    Type: Number
+    Default: 5432
+
+  # ---------- Valkey / Redis ----------
+  ValkeyEngineVersion:
+    Type: String
+    Default: "7.2"
+
+  ValkeyNodeType:
+    Type: String
+    Default: "cache.t3.small"
+
+  ValkeyAuthTokenSsmSecurePath:
+    Type: String
+    Description: SSM SecureString path for Valkey auth token (example: /app/qa/redis/auth_token)
+    Default: "/example/qa/redis/auth_token"
+
+Conditions:
+  UseAmiInfoCustomResource: !Not [!Equals [!Ref AmiInfoServiceToken, ""]]
+  UseExplicitAmis: !And
+    - !Equals [!Ref AmiInfoServiceToken, ""]
+    - !Not [!Equals [!Ref BastionAmiId, ""]]
+    - !Not [!Equals [!Ref WebAmiId, ""]]
+    - !Not [!Equals [!Ref AppAmiId, ""]]
+
+  UseExtraDbClientSg: !Not [!Equals [!Ref ExtraDbClientSecurityGroupId, ""]]
+  UseDnsCustomResource: !Not [!Equals [!Ref DnsRecordCustomResourceServiceToken, ""]]
+  UseDbSnapshot: !Not [!Equals [!Ref DbSnapshotArn, ""]]
+
+Resources:
+  # ---------------------------
+  # AMI custom resource (optional)
+  # ---------------------------
+  AMIInfo:
+    Type: Custom::AMIInfo
+    Condition: UseAmiInfoCustomResource
+    Properties:
+      ServiceToken: !Ref AmiInfoServiceToken
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "VPC-${ProjectName}"
+        - Key: Stack
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "IGW-${ProjectName}"
+        - Key: Stack
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs !Ref AWS::Region]
+      CidrBlock: !Ref PublicSubnet1Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "PublicSubnet1-${ProjectName}"
+        - Key: Stack
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs !Ref AWS::Region]
+      CidrBlock: !Ref PublicSubnet2Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "PublicSubnet2-${ProjectName}"
+        - Key: Stack
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs !Ref AWS::Region]
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "PrivateSubnet1-${ProjectName}"
+        - Key: Stack
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs !Ref AWS::Region]
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "PrivateSubnet2-${ProjectName}"
+        - Key: Stack
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName} Public Routes"
+        - Key: Stack
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  EIPForNatGateway:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIPForNatGateway.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub "NAT-${ProjectName}"
+        - Key: Stack
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName} Private Routes"
+        - Key: Stack
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  DefaultPrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
+
+  # ---------------------------
+  # Security Groups
+  # ---------------------------
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "ALB Security Group"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "SG-ALB-${ProjectName}"
+
+  BastionSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Bastion Security Group"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: !Select [0, !Ref AllowedRdpCidrs]
+        # NOTE: CloudFormation doesn't natively expand CommaDelimitedList into multiple ingress rules.
+        # If you need multiple CIDRs, duplicate this rule manually or convert to a custom macro/transform.
+      Tags:
+        - Key: Name
+          Value: !Sub "SG-BASTION-${ProjectName}"
+
+  WebSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Web tier Security Group"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref AlbSG
+        - IpProtocol: tcp
+          FromPort: 8443
+          ToPort: 8443
+          SourceSecurityGroupId: !Ref AlbSG
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          SourceSecurityGroupId: !Ref BastionSG
+      Tags:
+        - Key: Name
+          Value: !Sub "SG-WEB-${ProjectName}"
+
+  AppSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "App tier Security Group"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          SourceSecurityGroupId: !Ref BastionSG
+      Tags:
+        - Key: Name
+          Value: !Sub "SG-APP-${ProjectName}"
+
+  DatabaseSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Database Security Group"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref DbPort
+          ToPort: !Ref DbPort
+          SourceSecurityGroupId: !Ref WebSG
+        - IpProtocol: tcp
+          FromPort: !Ref DbPort
+          ToPort: !Ref DbPort
+          SourceSecurityGroupId: !Ref AppSG
+      Tags:
+        - Key: Name
+          Value: !Sub "SG-DB-${ProjectName}"
+
+  DatabaseSGExtraIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: UseExtraDbClientSg
+    Properties:
+      GroupId: !Ref DatabaseSG
+      IpProtocol: tcp
+      FromPort: !Ref DbPort
+      ToPort: !Ref DbPort
+      SourceSecurityGroupId: !Ref ExtraDbClientSecurityGroupId
+
+  RedisSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Valkey/Redis Security Group"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref WebSG
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref AppSG
+      Tags:
+        - Key: Name
+          Value: !Sub "SG-VALKEY-${ProjectName}"
+
+  # ---------------------------
+  # Load Balancer
+  # ---------------------------
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "ALB-${EnvironmentName}-${AWS::StackName}"
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref AlbSG
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '180'
+      Tags:
+        - Key: Name
+          Value: !Sub "ALB-${ProjectName}"
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "TG-WEB-${EnvironmentName}-${AWS::StackName}"
+      VpcId: !Ref VPC
+      Protocol: HTTPS
+      Port: 443
+      HealthCheckProtocol: HTTPS
+      HealthCheckPath: /health
+      HealthCheckPort: '8443'
+      TargetType: instance
+      Targets:
+        - Id: !Ref EC2InstanceWeb
+      Tags:
+        - Key: Name
+          Value: !Sub "TG-WEB-${ProjectName}"
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTPS
+      Port: 443
+      Certificates:
+        - CertificateArn: !Ref AcmCertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+
+  # Optional DNS Custom Resource (disabled by default)
+  Route53RecordCustomResource:
+    Type: "Custom::Route53Record"
+    Condition: UseDnsCustomResource
+    DependsOn: ApplicationLoadBalancer
+    Properties:
+      ServiceToken: !Ref DnsRecordCustomResourceServiceToken
+      HostedZoneId: !Ref HostedZoneId
+      RecordName: !Ref DnsRecordName
+      DNSName: !GetAtt ApplicationLoadBalancer.DNSName
+      ALBCanonicalHostedZoneID: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+      RoleToAssumeArn: !Ref DnsRecordAssumeRoleArn
+
+  # ---------------------------
+  # Valkey (ElastiCache-compatible Redis)
+  # ---------------------------
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: !Sub "Subnet group for ${ProjectName} ${EnvironmentName}"
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  ValkeyReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub "valkey-${EnvironmentName}-${AWS::StackName}"
+      ReplicationGroupDescription: !Sub "VALKEY ${ProjectName} ${EnvironmentName}"
+      Engine: valkey
+      EngineVersion: !Ref ValkeyEngineVersion
+      NumNodeGroups: 2
+      ReplicasPerNodeGroup: 1
+      AutomaticFailoverEnabled: true
+      CacheParameterGroupName: "default.valkey7.cluster.on"
+      CacheNodeType: !Ref ValkeyNodeType
+      TransitEncryptionEnabled: true
+      TransitEncryptionMode: required
+      AtRestEncryptionEnabled: true
+      AuthToken: !Sub "{{resolve:ssm-secure:${ValkeyAuthTokenSsmSecurePath}}}"
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      SecurityGroupIds:
+        - !Ref RedisSG
+      Port: 6379
+      AutoMinorVersionUpgrade: true
+      Tags:
+        - Key: Name
+          Value: !Sub "valkey-${ProjectName}"
+        - Key: Stack
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ---------------------------
+  # Aurora Serverless v2 PostgreSQL
+  # ---------------------------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "${ProjectName} DB subnet group"
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  DbCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: !Ref DbEngineVersion
+      DBClusterIdentifier: !Sub "db-${EnvironmentName}-${AWS::StackName}"
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DatabaseSG
+      MasterUsername: !Ref DbMasterUsername
+      StorageEncrypted: true
+      Port: !Ref DbPort
+      BackupRetentionPeriod: 1
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 4
+      # Restore from snapshot only if provided
+      SnapshotIdentifier: !If [UseDbSnapshot, !Ref DbSnapshotArn, !Ref "AWS::NoValue"]
+      Tags:
+        - Key: Name
+          Value: !Sub "db-${ProjectName}"
+        - Key: Stack
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "db-inst-${EnvironmentName}-${AWS::StackName}"
+      DBClusterIdentifier: !Ref DbCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+
+  # ---------------------------
+  # EC2 Instances
+  # ---------------------------
+  EC2InstanceBastion:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !If
+        - UseAmiInfoCustomResource
+        - !GetAtt AMIInfo.idBAST
+        - !Ref BastionAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref Ec2InstanceProfileName
+      SubnetId: !Ref PublicSubnet1
+      InstanceInitiatedShutdownBehavior: stop
+      SecurityGroupIds:
+        - !Ref BastionSG
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub "BASTION-${ProjectName}"
+        - Key: Stack
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          $log = "C:\ProgramData\Amazon\EC2-Windows\Launch\Log\stop-after-boot.log"
+          New-Item -ItemType Directory -Force -Path (Split-Path $log) | Out-Null
+          "Creating shutdown task $(Get-Date)" | Out-File $log -Append
+          $time = (Get-Date).AddMinutes(2).ToString('HH:mm')
+          schtasks /Create /TN "StopAfterFirstBoot" /SC ONCE /ST $time /RU SYSTEM /RL HIGHEST /TR "shutdown.exe /s /t 0" /F | Out-File $log -Append
+          schtasks /Run /TN "StopAfterFirstBoot" | Out-File $log -Append
+          </powershell>
+
+  EC2InstanceWeb:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !If
+        - UseAmiInfoCustomResource
+        - !GetAtt AMIInfo.idWEB
+        - !Ref WebAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref Ec2InstanceProfileName
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref WebSG
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub "WEB-${ProjectName}"
+        - Key: Stack
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  EC2InstanceApp:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !If
+        - UseAmiInfoCustomResource
+        - !GetAtt AMIInfo.idAPP
+        - !Ref AppAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref Ec2InstanceProfileName
+      SubnetId: !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref AppSG
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub "APP-${ProjectName}"
+        - Key: Stack
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: AppInstanceId
+          Value: "XXXX-XXXX-XXXX-XXXX"
+
+  # ---------------------------
+  # VPC Peering + local route to peer VPC
+  # ---------------------------
+  VpcPeeringConnection:
+    Type: AWS::EC2::VPCPeeringConnection
+    Properties:
+      VpcId: !Ref VPC
+      PeerVpcId: !Ref PeerVpcId
+      PeerOwnerId: !Ref PeerAccountId
+      PeerRoleArn: !Ref PeerRoleArn
+      Tags:
+        - Key: Name
+          Value: !Sub "VPC-PEERING-${AWS::StackName}"
+
+  PrivateRouteToPeerVpc:
+    Type: AWS::EC2::Route
+    DependsOn: VpcPeeringConnection
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: !Ref PeerVpcCidr
+      VpcPeeringConnectionId: !Ref VpcPeeringConnection
+
+  # ---------------------------
+  # Custom Resource Lambda (creates peer routes + optional peer SG ingress)
+  # ---------------------------
+  PeerRoutesLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "PeerRoutesLambdaRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: peer-routes-inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Ref PeerRoleArn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "PeerRoutesLambdaRole-${ProjectName}"
+
+  PeerRoutesLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "PeerRoutesCustomResource-${AWS::StackName}"
+      Description: "Custom Resource to create routes and optional SG ingress for the VPC Peering"
+      Runtime: python3.13
+      Role: !GetAtt PeerRoutesLambdaRole.Arn
+      Timeout: 120
+      Handler: index.handler
+      Code:
+        ZipFile: |
+          import json, boto3, urllib.request, os
+          from botocore.exceptions import ClientError
+
+          def send(resp_url, event, status, data=None, reason=None, phys_id=None):
+              body = {
+                  "Status": status,
+                  "Reason": reason or "See CloudWatch Logs for details.",
+                  "PhysicalResourceId": phys_id or "PeerRoutesCustomResource",
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {}
+              }
+              req = urllib.request.Request(resp_url, data=json.dumps(body).encode("utf-8"), method="PUT")
+              req.add_header("Content-Type", "")
+              urllib.request.urlopen(req)
+
+          def ensure_route(ec2, rtb_id, cidr, peering_id):
+              try:
+                  ec2.create_route(RouteTableId=rtb_id,
+                                   DestinationCidrBlock=cidr,
+                                   VpcPeeringConnectionId=peering_id)
+              except ClientError as e:
+                  code = e.response.get("Error", {}).get("Code", "")
+                  msg = e.response.get("Error", {}).get("Message", "")
+                  if code in ("RouteAlreadyExists",) or "exists" in msg or "Blackhole" in msg:
+                      ec2.replace_route(RouteTableId=rtb_id,
+                                        DestinationCidrBlock=cidr,
+                                        VpcPeeringConnectionId=peering_id)
+                  else:
+                      raise
+
+          def delete_route(ec2, rtb_id, cidr):
+              try:
+                  ec2.delete_route(RouteTableId=rtb_id, DestinationCidrBlock=cidr)
+              except ClientError as e:
+                  code = e.response.get("Error", {}).get("Code", "")
+                  if code in ("InvalidRoute.NotFound",):
+                      return
+                  raise
+
+          def ensure_sg_ingress(ec2, peer_sg_id, src_sg_id, src_acct_id, port):
+              perm = [{
+                  "IpProtocol": "tcp",
+                  "FromPort": port,
+                  "ToPort": port,
+                  "UserIdGroupPairs": [{
+                      "GroupId": src_sg_id,
+                      "UserId": src_acct_id
+                  }]
+              }]
+              try:
+                  ec2.authorize_security_group_ingress(GroupId=peer_sg_id, IpPermissions=perm)
+              except ClientError as e:
+                  code = e.response.get("Error", {}).get("Code", "")
+                  if code in ("InvalidPermission.Duplicate",):
+                      return
+                  raise
+
+          def delete_sg_ingress(ec2, peer_sg_id, src_sg_id, src_acct_id, port):
+              perm = [{
+                  "IpProtocol": "tcp",
+                  "FromPort": port,
+                  "ToPort": port,
+                  "UserIdGroupPairs": [{
+                      "GroupId": src_sg_id,
+                      "UserId": src_acct_id
+                  }]
+              }]
+              try:
+                  ec2.revoke_security_group_ingress(GroupId=peer_sg_id, IpPermissions=perm)
+              except ClientError as e:
+                  code = e.response.get("Error", {}).get("Code", "")
+                  if code in ("InvalidPermission.NotFound",):
+                      return
+                  raise
+
+          def handler(event, context):
+              resp_url = event["ResponseURL"]
+              try:
+                  props = event["ResourceProperties"]
+                  role_arn   = props["PeerRoleArn"]
+                  region     = props.get("Region") or os.environ.get("AWS_REGION")
+                  rtb_ids    = props["PeerPrivateRouteTableIds"]  # list
+                  dest_cidr  = props["RequesterVpcCidr"]
+                  peering_id = props["VpcPeeringConnectionId"]
+
+                  peer_sg_id = props.get("PeerRdsSecurityGroupId")
+                  src_sg_id  = props.get("RequesterAppSecurityGroupId")
+                  src_acct   = props.get("RequesterAccountId")
+                  rds_port   = int(props.get("RdsPort", 5432))
+
+                  sts = boto3.client("sts")
+                  creds = sts.assume_role(RoleArn=role_arn, RoleSessionName="peer-routes")
+                  ec2 = boto3.client("ec2",
+                                     region_name=region,
+                                     aws_access_key_id=creds["Credentials"]["AccessKeyId"],
+                                     aws_secret_access_key=creds["Credentials"]["SecretAccessKey"],
+                                     aws_session_token=creds["Credentials"]["SessionToken"])
+
+                  if event["RequestType"] in ("Create", "Update"):
+                      for rtb in rtb_ids:
+                          ensure_route(ec2, rtb, dest_cidr, peering_id)
+                      if peer_sg_id and src_sg_id and src_acct:
+                          ensure_sg_ingress(ec2, peer_sg_id, src_sg_id, src_acct, rds_port)
+                      send(resp_url, event, "SUCCESS", {"Message": "Routes/SG ensured"})
+                  elif event["RequestType"] == "Delete":
+                      for rtb in rtb_ids:
+                          delete_route(ec2, rtb, dest_cidr)
+                      if peer_sg_id and src_sg_id and src_acct:
+                          delete_sg_ingress(ec2, peer_sg_id, src_sg_id, src_acct, rds_port)
+                      send(resp_url, event, "SUCCESS", {"Message": "Routes/SG deleted"})
+                  else:
+                      send(resp_url, event, "SUCCESS", {"Message": "Noop"})
+              except Exception as e:
+                  send(resp_url, event, "FAILED", reason=str(e))
+
+  PeerRoutesCustomResource:
+    Type: Custom::PeerRoutes
+    DependsOn:
+      - VpcPeeringConnection
+      - AppSG
+    Properties:
+      ServiceToken: !GetAtt PeerRoutesLambda.Arn
+      Region: !Ref AWS::Region
+      PeerRoleArn: !Ref PeerRoleArn
+      PeerPrivateRouteTableIds: !Ref PeerPrivateRouteTableIds
+      RequesterVpcCidr: !Ref VpcCidr
+      VpcPeeringConnectionId: !Ref VpcPeeringConnection
+      PeerRdsSecurityGroupId: !Ref PeerRdsSecurityGroupId
+      RequesterAppSecurityGroupId: !Ref AppSG
+      RequesterAccountId: !Ref AWS::AccountId
+      RdsPort: !Ref DbPort
+
+Outputs:
+  ALBDNSName:
+    Description: The DNS name of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+
+  DBClusterEndpoint:
+    Description: The connection endpoint for the Aurora DB cluster
+    Value: !GetAtt DbCluster.Endpoint.Address
+
+  DBClusterPort:
+    Description: The connection port for the Aurora DB cluster
+    Value: !GetAtt DbCluster.Endpoint.Port
+
+  ValkeyConfigurationEndpoint:
+    Description: The Configuration Endpoint for the Valkey replication group
+    Value: !GetAtt ValkeyReplicationGroup.ConfigurationEndPoint.Address
+
+  ValkeyConfigurationPort:
+    Description: The Port for the Valkey replication group
+    Value: !GetAtt ValkeyReplicationGroup.ConfigurationEndPoint.Port
